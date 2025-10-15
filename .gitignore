@@ -1,0 +1,36 @@
+# Archivos de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Entornos virtuales
+.env/
+.venv/
+venv/
+ENV/
+
+# Archivos temporales y logs
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Carpetas locales
+outputs/
+audios/
+tmp/
+.DS_Store
+
+# Archivos del sistema y configuración
+*.sqlite3
+*.db
+*.idea/
+*.vscode/
+*.ipynb_checkpoints/
+
+# Archivos grandes o generados automáticamente
+*.wav
+*.mp3
+*.mid
+*.musicxml
