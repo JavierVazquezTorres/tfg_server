@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# libsndfile y ffmpeg para audio
+# libs del SO para audio
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
       libsndfile1 \
@@ -12,10 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 👇 copiamos *el nuevo nombre* y mostramos su contenido
+COPY app.requirements.txt /app/requirements.txt
+RUN echo "===== REQUIREMENTS THAT WILL BE INSTALLED =====" \
+ && cat /app/requirements.txt \
+ && python -m pip install --upgrade pip \
+ && pip install --no-cache-dir -r /app/requirements.txt
 
 COPY server.py transcribe.py ./
 
-# Render inyecta $PORT
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+# logs de acceso + proxy headers
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "${PORT}", "--proxy-headers", "--forwarded-allow-ips", "*", "--log-level", "info", "--access-log"]
