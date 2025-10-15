@@ -20,4 +20,4 @@ RUN echo "===== REQUIREMENTS INSTALADOS =====" \
 
 COPY server.py transcribe.py ./
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "${PORT}", "--proxy-headers", "--forwarded-allow-ips", "*", "--log-level", "info", "--access-log"]
+CMD sh -c "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips * --log-level info --access-log"
