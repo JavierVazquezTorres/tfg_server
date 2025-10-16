@@ -1,95 +1,83 @@
-import librosa
 import numpy as np
-import json
-from flask import Flask, request, jsonify
-import os
+import soundfile as sf
+import librosa
 
-app = Flask(__name__)
+# Parámetros
+TARGET_SR = 8000       # trabajamos a 8 kHz (más rápido y es lo que graba la app)
+HOP = 128              # 8k/128 = 62.5 fps -> ~16 ms por frame
+FRAME = 2048
+FMIN_HZ, FMAX_HZ = 60.0, 1200.0   # rango amplio (voz e instrumentos)
+MIN_DUR = 0.05         # descarta notas < 50 ms
+MAX_SEC = 20.0         # límite duro para no eternizar
 
-UPLOAD_FOLDER = "audios"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+def _load(path, sr=TARGET_SR, max_sec=MAX_SEC):
+    y, in_sr = sf.read(path, dtype="float32", always_2d=False)
+    if y.ndim == 2:
+        y = np.mean(y, axis=1)
+    if in_sr != sr:
+        y = librosa.resample(y, orig_sr=in_sr, target_sr=sr)
+    if max_sec and len(y) > int(sr * max_sec):
+        y = y[: int(sr * max_sec)]
+    return y, sr
 
-@app.route("/")
-def index():
-    return jsonify({"status": "Servidor activo 🚀"})
+def _segments_from_flags(flags: np.ndarray):
+    v = np.asarray(flags, dtype=np.int8)
+    if v.size == 0:
+        return []
+    edges = np.flatnonzero(np.diff(np.pad(v, (1, 1), mode="constant")))
+    segs = []
+    for i in range(0, len(edges), 2):
+        s = edges[i]
+        e = edges[i + 1] if i + 1 < len(edges) else len(v)
+        if e > s:
+            segs.append((s, e))
+    return segs
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
-    if "file" not in request.files:
-        return jsonify({"error": "No se envió archivo"}), 400
+def transcribe_to_json(path: str) -> dict:
+    # Cargar y normalizar
+    y, sr = _load(path)
 
-    f = request.files["file"]
-    path = os.path.join(UPLOAD_FOLDER, f.filename)
-    f.save(path)
+    # Pitch por frame con pYIN (monofónico)
+    f0, vflag, _ = librosa.pyin(
+        y,
+        fmin=FMIN_HZ, fmax=FMAX_HZ,
+        sr=sr, frame_length=FRAME, hop_length=HOP,
+        center=False
+    )
+    if vflag is None:
+        vflag = np.isfinite(f0)
 
-    try:
-        # --- Cargar audio ---
-        y, sr = librosa.load(path, sr=16000, mono=True)
+    # Segmentación por tramos de voz
+    segs = _segments_from_flags(vflag)
 
-        # --- Detección de pitch (pYIN) ---
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            y,
-            fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7"),
-            frame_length=2048,
-            sr=sr
-        )
+    notes = []
+    for s_f, e_f in segs:
+        start_samp = int(s_f * HOP)
+        end_samp   = int(min(len(y), e_f * HOP))
+        start_t = start_samp / sr
+        end_t   = end_samp / sr
+        dur = end_t - start_t
+        if dur < MIN_DUR:
+            continue
 
-        # --- Convertir a notas ---
-        times = librosa.times_like(f0, sr=sr)
-        notes = []
+        f0_seg = f0[s_f:e_f]
+        f0_valid = f0_seg[np.isfinite(f0_seg)]
+        if f0_valid.size == 0:
+            continue
 
-        last_note = None
-        start_time = None
+        hz_med = float(np.median(f0_valid))
+        note_name = librosa.hz_to_note(hz_med, cents=False)
 
-        for t, pitch, voiced in zip(times, f0, voiced_flag):
-            if voiced and pitch is not None:
-                current_note = librosa.hz_to_note(pitch)
-                if last_note is None:
-                    last_note = current_note
-                    start_time = t
-                elif current_note != last_note:
-                    notes.append({
-                        "note": last_note,
-                        "start": float(start_time),
-                        "end": float(t),
-                        "duration": float(t - start_time)
-                    })
-                    last_note = current_note
-                    start_time = t
-            elif last_note is not None:
-                notes.append({
-                    "note": last_note,
-                    "start": float(start_time),
-                    "end": float(t),
-                    "duration": float(t - start_time)
-                })
-                last_note = None
-                start_time = None
-
-        if last_note is not None and start_time is not None:
-            notes.append({
-                "note": last_note,
-                "start": float(start_time),
-                "end": float(times[-1]),
-                "duration": float(times[-1] - start_time)
-            })
-
-        # --- Calcular tempo aproximado ---
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-
-        # --- Filtrar duraciones y limpiar ---
-        notes = [n for n in notes if n["duration"] > 0.05]
-
-        return jsonify({
-            "tempo": round(float(tempo), 2),
-            "notes": notes,
-            "count": len(notes)
+        notes.append({
+            "pitch": note_name,
+            "start": float(start_t),
+            "end": float(end_t),
         })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    # Tempo aproximado (opcional)
+    try:
+        tempo = float(librosa.beat.tempo(y=y, sr=sr, hop_length=HOP)[0])
+    except Exception:
+        tempo = None
 
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    return {"tempo": tempo, "notes": notes}
