@@ -1,72 +1,86 @@
 import numpy as np
-import soundfile as sf
 import librosa
+import librosa.display
 
-TARGET_SR = 16000
-HOP_LENGTH = 160            # 10 ms a 16 kHz
-FRAME_LENGTH = 2048
-FMIN_HZ, FMAX_HZ = 50.0, 1000.0
-MIN_NOTE_DUR = 0.06         # 60 ms
-DEFAULT_BPM, DEFAULT_TS = 100, "4/4"
+# Utilidad: convertir Hz a nombre de nota cercano (C4, A#3, etc.)
+def hz_to_note_name(hz: float) -> str:
+    if not np.isfinite(hz) or hz <= 0:
+        return "Rest"
+    # librosa.hz_to_note devuelve strings tipo 'C#4'
+    return librosa.hz_to_note(hz, cents=False)
 
-def _load_audio(path, sr=TARGET_SR, max_sec=30):
-    y, in_sr = sf.read(path, always_2d=False)
-    if y.ndim > 1: y = np.mean(y, axis=1)
-    if in_sr != sr: y = librosa.resample(y, orig_sr=in_sr, target_sr=sr)
-    if max_sec and len(y) > sr * max_sec: y = y[: sr * max_sec]
-    y = librosa.util.normalize(y).astype(np.float32)
-    return y, sr
+def transcribe_to_json(path: str) -> dict:
+    # Carga mono a 16 kHz (como graba la app)
+    y, sr = librosa.load(path, sr=16000, mono=True)
 
-def _f0_librosa_pyin(y, sr, fmin=FMIN_HZ, fmax=FMAX_HZ, frame_length=FRAME_LENGTH, hop_length=HOP_LENGTH):
-    # pyin devuelve f0 (Hz), voiced_flag y probabilidad
-    f0, vflag, _ = librosa.pyin(
-        y, fmin=fmin, fmax=fmax, sr=sr,
-        frame_length=frame_length, hop_length=hop_length
+    # Pitch tracking con pYIN (monofónico). Ajusta fmin/fmax a tu rango
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz("C2"),
+        fmax=librosa.note_to_hz("C7"),
+        sr=sr,
+        frame_length=2048,
+        hop_length=256,
+        center=True,
     )
-    # f0 es array con NaN cuando no hay voz
-    f0 = np.where(vflag, np.nan_to_num(f0, nan=0.0), 0.0).astype(np.float32)
-    times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
-    return times, f0
+    # Tiempo por frame
+    frames = np.arange(len(f0))
+    times = librosa.frames_to_time(frames, sr=sr, hop_length=256)
 
-def _segment_notes(times, f0_hz, min_dur=MIN_NOTE_DUR):
-    notes, s, voiced = [], None, (f0_hz > 0)
-    n = len(f0_hz)
-    for i in range(n):
-        last = (i == n - 1)
-        if voiced[i] and s is None: s = i
-        if ((not voiced[i]) or last) and s is not None:
-            e = i if not voiced[i] else (i + 1)
-            dur = max(0.0, times[e-1] - times[s]) if (e-1) > s else 0.0
-            if dur >= min_dur:
-                hz_med = float(np.median(f0_hz[s:e][f0_hz[s:e] > 0]))
-                notes.append((times[s], times[e-1], hz_med))
-            s = None
-    return notes
+    # Estima tempo (opcional)
+    try:
+        tempo = float(librosa.beat.tempo(y=y, sr=sr, hop_length=256)[0])
+    except Exception:
+        tempo = None
 
-def _hz_to_midi(hz): return 69 + 12 * np.log2(hz / 440.0)
+    # Segmentación: agrupa frames "voiced" consecutivos en notas
+    notes = []
+    min_duration = 0.05  # 50 ms para evitar notas demasiado cortas
+    i = 0
+    N = len(f0)
 
-def _midi_to_name(m):
-    names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-    m = int(round(m)); return f"{names[m % 12]}{(m // 12) - 1}"
+    while i < N:
+        if not voiced_flag[i]:
+            i += 1
+            continue
 
-def _quantize_len(sec, bpm=DEFAULT_BPM):
-    beat = 60.0 / bpm
-    grid = [("whole", 4*beat), ("half", 2*beat), ("quarter", beat),
-            ("eighth", beat/2), ("16th", beat/4)]
-    name, q = min(grid, key=lambda x: abs(sec - x[1]))
-    return name, q
+        # inicio del segmento con voz
+        start_idx = i
+        segment_freqs = []
 
-def transcribe_to_json(path, bpm=DEFAULT_BPM, time_sig=DEFAULT_TS):
-    y, sr = _load_audio(path)
-    times, f0 = _f0_librosa_pyin(y, sr)
-    seg = _segment_notes(times, f0)
+        while i < N and voiced_flag[i]:
+            if np.isfinite(f0[i]) and f0[i] > 0:
+                segment_freqs.append(f0[i])
+            i += 1
+        end_idx = i  # excluyente
 
-    out = []
-    for t0, t1, hz in seg:
-        midi = _hz_to_midi(hz)
-        pname = _midi_to_name(midi)
-        dur = t1 - t0
-        fig, _ = _quantize_len(dur, bpm)
-        out.append({"pitch": pname, "duration": fig})
+        start_t = float(times[start_idx])
+        end_t = float(times[min(end_idx - 1, N - 1)])
 
-    return {"tempo": bpm, "time_signature": time_sig, "notes": out}
+        # Asegura que end_t > start_t
+        if end_t <= start_t:
+            continue
+
+        duration = end_t - start_t
+        if duration < min_duration:
+            continue
+
+        # Nota del segmento: mediana de f0 del tramo
+        if len(segment_freqs) == 0:
+            # Sin f0 válida; ignora
+            continue
+
+        hz_med = float(np.median(segment_freqs))
+        note_name = hz_to_note_name(hz_med)
+
+        notes.append({
+            "pitch": note_name,
+            "start": start_t,
+            "end": end_t,
+        })
+
+    result = {
+        "tempo": tempo,
+        "notes": notes,
+    }
+    return result
