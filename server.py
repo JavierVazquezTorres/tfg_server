@@ -5,26 +5,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from transcribe import transcribe_to_json
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tfg-server")
+log = logging.getLogger("tfg-server")
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
 
 @app.get("/")
-def health(): return {"status":"ok"}
+def health():
+    return {"status": "ok"}
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
-    uid = uuid.uuid4().hex[:8]
+    tag = uuid.uuid4().hex[:6]
     try:
-        logger.info(f"[{uid}] start name={file.filename} ctype={file.content_type}")
         with tempfile.TemporaryDirectory() as td:
-            inpath = os.path.join(td, f"{uid}_{file.filename or 'audio.wav'}")
-            raw = await file.read(); logger.info(f"[{uid}] bytes={len(raw)}")
-            with open(inpath, "wb") as f: f.write(raw)
+            inpath = os.path.join(td, file.filename or f"{tag}.wav")
+            raw = await file.read()
+            with open(inpath, "wb") as f:
+                f.write(raw)
             res = transcribe_to_json(inpath)
-            logger.info(f"[{uid}] ok notes={len(res.get('notes',[]))}")
-            return JSONResponse(res)
+
+        # Log: primeras 3 notas con tiempos
+        sample = res.get("notes", [])[:3]
+        log.info("[%s] tempo=%s sample=%s", tag, res.get("tempo"), sample)
+        return JSONResponse(res)
     except Exception as e:
-        logger.exception(f"[{uid}] error")
+        log.exception("[%s] error en transcribe", tag)
         return PlainTextResponse(str(e), status_code=500)
